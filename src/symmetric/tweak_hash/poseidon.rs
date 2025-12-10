@@ -377,78 +377,77 @@ impl<
         parent_start: usize,
         children: &[Self::Domain],
     ) -> Vec<Self::Domain> {
-        // SIMD implementation specifically for Poseidon
         const WIDTH: usize = PackedF::WIDTH;
 
-        // Broadcast the hash parameter to all SIMD lanes.
-        // Each lane will use the same parameter
-        let packed_parameter: [PackedF; PARAMETER_LEN] =
-            array::from_fn(|i| PackedF::from(parameter[i]));
+        // Pre-allocate output vector
+        let output_len = children.len() / 2;
+        let mut parents = vec![FieldArray([F::ZERO; HASH_LEN]); output_len];
 
-        // permutation to use for the compression. 24 as we merge two inputs
+        // Broadcast the hash parameter to all SIMD lanes (computed once)
+        let packed_parameter: [PackedF; PARAMETER_LEN] =
+            array::from_fn(|i| PackedF::from(parameter.0[i]));
+
+        // Permutation for merging two inputs (width-24)
         let perm = poseidon2_24();
 
-        // preallocate a vector that can hold the SIMD part as well as any possible scalar remainder
-        let mut parents = Vec::with_capacity(children.len() / 2);
-        parents.par_extend(children.par_chunks_exact(2 * WIDTH).enumerate().flat_map(
-            |(i, children)| {
-                let parent_pos = (parent_start + i * WIDTH) as u32;
-                let packed_tweak = array::from_fn::<_, TWEAK_LEN, _>(|t_idx| {
+        // Process SIMD batches with in-place mutation
+        parents
+            .par_chunks_exact_mut(WIDTH)
+            .zip(children.par_chunks_exact(2 * WIDTH))
+            .enumerate()
+            .for_each(|(chunk_idx, (parents_chunk, children_chunk))| {
+                let parent_pos = (parent_start + chunk_idx * WIDTH) as u32;
+
+                // DIRECT PACKING
+                //
+                // Pack left children: children[0], children[2], children[4], ...
+                let packed_left: [PackedF; HASH_LEN] =
+                    array::from_fn(|h| PackedF::from_fn(|lane| children_chunk[2 * lane].0[h]));
+
+                // Pack right children: children[1], children[3], children[5], ...
+                let packed_right: [PackedF; HASH_LEN] =
+                    array::from_fn(|h| PackedF::from_fn(|lane| children_chunk[2 * lane + 1].0[h]));
+
+                // Pack tweaks directly (no intermediate scalar arrays)
+                let packed_tweak: [PackedF; TWEAK_LEN] = array::from_fn(|t_idx| {
                     PackedF::from_fn(|lane| {
-                        let parent_pos_per_lane = parent_pos + (lane as u32);
-                        Self::tree_tweak(level, parent_pos_per_lane)
+                        Self::tree_tweak(level, parent_pos + lane as u32)
                             .to_field_elements::<TWEAK_LEN>()[t_idx]
                     })
                 });
 
-                // Assemble the packed input for the hash function.
-                // Layout: [parameter | tweak | left | right]
+                // Assemble packed input: [parameter | tweak | left | right]
                 let mut packed_input = [PackedF::ZERO; MERGE_COMPRESSION_WIDTH];
-                let mut current_pos = 0;
+                packed_input[..PARAMETER_LEN].copy_from_slice(&packed_parameter);
+                packed_input[PARAMETER_LEN..PARAMETER_LEN + TWEAK_LEN]
+                    .copy_from_slice(&packed_tweak);
+                packed_input[PARAMETER_LEN + TWEAK_LEN..PARAMETER_LEN + TWEAK_LEN + HASH_LEN]
+                    .copy_from_slice(&packed_left);
+                packed_input[PARAMETER_LEN + TWEAK_LEN + HASH_LEN
+                    ..PARAMETER_LEN + TWEAK_LEN + 2 * HASH_LEN]
+                    .copy_from_slice(&packed_right);
 
-                // Copy parameter into the input buffer.
-                packed_input[current_pos..current_pos + PARAMETER_LEN]
-                    .copy_from_slice(&packed_parameter);
-                current_pos += PARAMETER_LEN;
-
-                // Copy tweak into the input buffer.
-                packed_input[current_pos..current_pos + TWEAK_LEN].copy_from_slice(&packed_tweak);
-                current_pos += TWEAK_LEN;
-
-                // Copy the left child value into the input buffer.
-                let lefts: [FieldArray<HASH_LEN>; WIDTH] = array::from_fn(|k| children[2 * k]);
-                let packed_lefts = pack_array(&lefts);
-                packed_input[current_pos..current_pos + HASH_LEN].copy_from_slice(&packed_lefts);
-                current_pos += HASH_LEN;
-
-                // Copy the right child value into the input buffer.
-                let rights: [FieldArray<HASH_LEN>; WIDTH] = array::from_fn(|k| children[2 * k + 1]);
-                let packed_rights = pack_array(&rights);
-                packed_input[current_pos..current_pos + HASH_LEN].copy_from_slice(&packed_rights);
-
+                // Compress all WIDTH parent pairs simultaneously
                 let packed_parents =
                     poseidon_compress::<PackedF, _, MERGE_COMPRESSION_WIDTH, HASH_LEN>(
                         &perm,
                         &packed_input,
                     );
 
-                // unpack the parents from SIMD to scalar output
-                let mut parents = [FieldArray([F::ZERO; HASH_LEN]); WIDTH];
-                unpack_array(&packed_parents, &mut parents);
+                // Unpack directly to output slice
+                unpack_array(&packed_parents, parents_chunk);
+            });
 
-                parents
-            },
-        ));
+        // Handle remainder (elements that don't fill a complete SIMD batch)
+        let remainder_start = (children.len() / (2 * WIDTH)) * WIDTH;
+        let children_remainder = &children[remainder_start * 2..];
+        let parents_remainder = &mut parents[remainder_start..];
 
-        // handle non WIDTH left over elements
-        let remainder = children.par_chunks_exact(2 * WIDTH).remainder();
-
-        // TODO: parallel iterator here likely not worth it?
-        let num_simd_parents = parents.len();
-        parents.par_extend(remainder.par_chunks_exact(2).enumerate().map(|(i, pair)| {
-            let pos = parent_start + num_simd_parents + i;
-            Self::apply(parameter, &Self::tree_tweak(level, pos as u32), pair)
-        }));
+        for (i, pair) in children_remainder.chunks_exact(2).enumerate() {
+            let pos = parent_start + remainder_start + i;
+            parents_remainder[i] =
+                Self::apply(parameter, &Self::tree_tweak(level, pos as u32), pair);
+        }
 
         parents
     }
