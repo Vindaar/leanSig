@@ -27,6 +27,10 @@ pub trait TweakableHash {
     /// Domain element type (defines output and input types to the hash)
     type Domain: Copy + PartialEq + Send + Sync + Serializable;
 
+    /// Precomputed domain separator for sponge mode (used when hashing many elements).
+    /// For implementations that don't need this, use `()`.
+    type DomainSeparator: Copy + Send + Sync;
+
     /// Generates a random public parameter.
     fn rand_parameter<R: Rng>(rng: &mut R) -> Self::Parameter;
 
@@ -41,11 +45,18 @@ pub trait TweakableHash {
     /// Note: this is assumed to be distinct from the outputs of tree_tweak
     fn chain_tweak(epoch: u32, chain_index: u8, pos_in_chain: u8) -> Self::Tweak;
 
+    /// Computes the domain separator for sponge mode.
+    /// This can be called once and reused for multiple `apply` calls.
+    fn compute_domain_separator() -> Self::DomainSeparator;
+
     /// Applies the tweakable hash to parameter, tweak, and message.
+    /// The `domain_sep` parameter is optional; if `None`, it will be computed internally.
+    /// For performance, precompute with `compute_domain_separator()` when calling repeatedly.
     fn apply(
         parameter: &Self::Parameter,
         tweak: &Self::Tweak,
         message: &[Self::Domain],
+        domain_sep: Option<&Self::DomainSeparator>,
     ) -> Self::Domain;
 
     /// Applies the calculation for a single tweak hash tree layer.
@@ -67,6 +78,7 @@ pub trait TweakableHash {
                     parameter,
                     &Self::tree_tweak(level + 1, parent_pos),
                     children,
+                    None,
                 )
             })
             .collect()
@@ -115,7 +127,7 @@ pub fn chain<TH: TweakableHash>(
     // otherwise, walk the right amount of steps
     for j in 0..steps {
         let tweak = TH::chain_tweak(epoch, chain_index, start_pos_in_chain + (j as u8) + 1u8);
-        current = TH::apply(parameter, &tweak, &[current]);
+        current = TH::apply(parameter, &tweak, &[current], None);
     }
 
     // return where we are now

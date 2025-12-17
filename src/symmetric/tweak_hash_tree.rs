@@ -618,7 +618,7 @@ pub fn hash_tree_verify<TH: TweakableHash>(
 
     // first hash the leaf to get the node in the bottom layer
     let tweak = TH::tree_tweak(0, position);
-    let mut current_node = TH::apply(parameter, &tweak, leaf);
+    let mut current_node = TH::apply(parameter, &tweak, leaf, None);
 
     // now reconstruct the root using the co-path
     let mut current_position = position;
@@ -638,7 +638,7 @@ pub fn hash_tree_verify<TH: TweakableHash>(
 
         // now hash to get the parent
         let tweak = TH::tree_tweak((l + 1) as u8, current_position);
-        current_node = TH::apply(parameter, &tweak, &children);
+        current_node = TH::apply(parameter, &tweak, &children, None);
     }
 
     // Finally, check that recomputed root matches given root
@@ -687,6 +687,7 @@ mod tests {
                     &parameter,
                     &TestTH::tree_tweak(0, (i + start_index) as u32),
                     v.as_slice(),
+                    None,
                 )
             })
             .collect();
@@ -825,6 +826,7 @@ mod tests {
                     &parameter,
                     &TestTH::tree_tweak(0, (i + start_index) as u32),
                     v.as_slice(),
+                    None,
                 )
             })
             .collect();
@@ -1103,7 +1105,7 @@ mod tests {
         let leafs_hashes: Vec<_> = leafs
             .iter()
             .enumerate()
-            .map(|(i, v)| TestTH::apply(&parameter, &TestTH::tree_tweak(0, i as u32), v.as_slice()))
+            .map(|(i, v)| TestTH::apply(&parameter, &TestTH::tree_tweak(0, i as u32), v.as_slice(), None))
             .collect();
         // Build complete merkle tree
         let tree = HashSubTree::<TestTH>::new_subtree(

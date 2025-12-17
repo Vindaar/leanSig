@@ -256,6 +256,8 @@ impl<
 
     type Domain = FieldArray<HASH_LEN>;
 
+    type DomainSeparator = [F; CAPACITY];
+
     fn rand_parameter<R: rand::Rng>(rng: &mut R) -> Self::Parameter {
         FieldArray(rng.random())
     }
@@ -279,10 +281,22 @@ impl<
         }
     }
 
+    fn compute_domain_separator() -> Self::DomainSeparator {
+        let perm = poseidon2_24();
+        let lengths: [u32; DOMAIN_PARAMETERS_LENGTH] = [
+            PARAMETER_LEN as u32,
+            TWEAK_LEN as u32,
+            NUM_CHUNKS as u32,
+            HASH_LEN as u32,
+        ];
+        poseidon_safe_domain_separator::<CAPACITY>(&perm, &lengths)
+    }
+
     fn apply(
         parameter: &Self::Parameter,
         tweak: &Self::Tweak,
         message: &[Self::Domain],
+        domain_sep: Option<&Self::DomainSeparator>,
     ) -> Self::Domain {
         // we are in one of three cases:
         // (1) hashing within chains. We use compression mode.
@@ -337,16 +351,9 @@ impl<
                     .copied()
                     .collect();
 
-                let lengths: [u32; DOMAIN_PARAMETERS_LENGTH] = [
-                    PARAMETER_LEN as u32,
-                    TWEAK_LEN as u32,
-                    NUM_CHUNKS as u32,
-                    HASH_LEN as u32,
-                ];
+                // Use precomputed domain separator if provided, otherwise compute it
                 let capacity_value =
-                    poseidon_safe_domain_separator::<F, _, MERGE_COMPRESSION_WIDTH, CAPACITY>(
-                        &perm, &lengths,
-                    );
+                    domain_sep.map_or_else(Self::compute_domain_separator, |sep| *sep);
                 FieldArray(poseidon_sponge::<F, _, MERGE_COMPRESSION_WIDTH, HASH_LEN>(
                     &perm,
                     &capacity_value,
@@ -426,7 +433,7 @@ impl<
         for (i, pair) in children_remainder.chunks_exact(2).enumerate() {
             let pos = parent_start + remainder_start + i;
             parents_remainder[i] =
-                Self::apply(parameter, &Self::tree_tweak(level, pos as u32), pair);
+                Self::apply(parameter, &Self::tree_tweak(level, pos as u32), pair, None);
         }
 
         parents
@@ -486,11 +493,8 @@ impl<
             NUM_CHUNKS as u32,
             HASH_LEN as u32,
         ];
-        let capacity_val =
-            poseidon_safe_domain_separator::<PackedF, _, MERGE_COMPRESSION_WIDTH, CAPACITY>(
-                &sponge_perm,
-                &lengths,
-            );
+        let capacity_val: [PackedF; CAPACITY] =
+            poseidon_safe_domain_separator::<CAPACITY>(&sponge_perm, &lengths).map(PackedF::from);
 
         // PARALLEL SIMD PROCESSING
         //
@@ -629,27 +633,39 @@ impl<
         // This ensures correctness for all input sizes.
 
         let remainder_start = (epochs.len() / width) * width;
-        for (i, epoch) in epochs[remainder_start..].iter().enumerate() {
-            let global_index = remainder_start + i;
+        let remainder_epochs = &epochs[remainder_start..];
 
-            // Walk all chains for this epoch.
-            let chain_ends: Vec<_> = (0..NUM_CHUNKS)
-                .map(|chain_index| {
-                    let start = PRF::get_domain_element(prf_key, *epoch, chain_index as u64).into();
-                    chain::<Self>(
-                        parameter,
-                        *epoch,
-                        chain_index as u8,
-                        0,
-                        chain_length - 1,
-                        &start,
-                    )
-                })
-                .collect();
+        if !remainder_epochs.is_empty() {
+            // Precompute domain separator for the remainder loop
+            let domain_sep = Self::compute_domain_separator();
 
-            // Hash the chain ends to produce the leaf.
-            leaves[global_index] =
-                Self::apply(parameter, &Self::tree_tweak(0, *epoch), &chain_ends);
+            for (i, epoch) in remainder_epochs.iter().enumerate() {
+                let global_index = remainder_start + i;
+
+                // Walk all chains for this epoch.
+                let chain_ends: Vec<_> = (0..NUM_CHUNKS)
+                    .map(|chain_index| {
+                        let start =
+                            PRF::get_domain_element(prf_key, *epoch, chain_index as u64).into();
+                        chain::<Self>(
+                            parameter,
+                            *epoch,
+                            chain_index as u8,
+                            0,
+                            chain_length - 1,
+                            &start,
+                        )
+                    })
+                    .collect();
+
+                // Hash the chain ends to produce the leaf.
+                leaves[global_index] = Self::apply(
+                    parameter,
+                    &Self::tree_tweak(0, *epoch),
+                    &chain_ends,
+                    Some(&domain_sep),
+                );
+            }
         }
 
         leaves
@@ -723,19 +739,19 @@ mod tests {
         let message_one = PoseidonTweak44::rand_domain(&mut rng);
         let message_two = PoseidonTweak44::rand_domain(&mut rng);
         let tweak_tree = PoseidonTweak44::tree_tweak(0, 3);
-        let _ = PoseidonTweak44::apply(&parameter, &tweak_tree, &[message_one, message_two]);
+        let _ = PoseidonTweak44::apply(&parameter, &tweak_tree, &[message_one, message_two], None);
 
         // test that nothing is panicking
         let parameter = PoseidonTweak44::rand_parameter(&mut rng);
         let message_one = PoseidonTweak44::rand_domain(&mut rng);
         let tweak_chain = PoseidonTweak44::chain_tweak(2, 3, 4);
-        let _ = PoseidonTweak44::apply(&parameter, &tweak_chain, &[message_one]);
+        let _ = PoseidonTweak44::apply(&parameter, &tweak_chain, &[message_one], None);
 
         // test that nothing is panicking
         let parameter = PoseidonTweak44::rand_parameter(&mut rng);
         let chains = [PoseidonTweak44::rand_domain(&mut rng); 128];
         let tweak_tree = PoseidonTweak44::tree_tweak(0, 3);
-        let _ = PoseidonTweak44::apply(&parameter, &tweak_tree, &chains);
+        let _ = PoseidonTweak44::apply(&parameter, &tweak_tree, &chains, None);
     }
 
     #[test]
@@ -750,13 +766,13 @@ mod tests {
         let message_one = PoseidonTweak37::rand_domain(&mut rng);
         let message_two = PoseidonTweak37::rand_domain(&mut rng);
         let tweak_tree = PoseidonTweak37::tree_tweak(0, 3);
-        let _ = PoseidonTweak37::apply(&parameter, &tweak_tree, &[message_one, message_two]);
+        let _ = PoseidonTweak37::apply(&parameter, &tweak_tree, &[message_one, message_two], None);
 
         // test that nothing is panicking
         let parameter = PoseidonTweak37::rand_parameter(&mut rng);
         let message_one = PoseidonTweak37::rand_domain(&mut rng);
         let tweak_chain = PoseidonTweak37::chain_tweak(2, 3, 4);
-        let _ = PoseidonTweak37::apply(&parameter, &tweak_chain, &[message_one]);
+        let _ = PoseidonTweak37::apply(&parameter, &tweak_chain, &[message_one], None);
     }
 
     #[test]
@@ -1118,6 +1134,9 @@ mod tests {
     where
         PRF::Domain: Into<TH::Domain>,
     {
+        // Precompute domain separator once for all epochs
+        let domain_sep = TH::compute_domain_separator();
+
         // Process each epoch in parallel
         epochs
             .iter()
@@ -1140,7 +1159,12 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 // Build hash of chain ends / public keys
-                TH::apply(parameter, &TH::tree_tweak(0, epoch), &chain_ends)
+                TH::apply(
+                    parameter,
+                    &TH::tree_tweak(0, epoch),
+                    &chain_ends,
+                    Some(&domain_sep),
+                )
             })
             .collect()
     }
@@ -1280,8 +1304,8 @@ mod tests {
             let tweak = PoseidonTweak44::chain_tweak(epoch, chain_index, pos_in_chain);
 
             // call apply twice to check determinism
-            let result1 = PoseidonTweak44::apply(&parameter, &tweak, &[message]);
-            let result2 = PoseidonTweak44::apply(&parameter, &tweak, &[message]);
+            let result1 = PoseidonTweak44::apply(&parameter, &tweak, &[message], None);
+            let result2 = PoseidonTweak44::apply(&parameter, &tweak, &[message], None);
 
             // check determinism
             prop_assert_eq!(result1, result2);
@@ -1295,7 +1319,7 @@ mod tests {
                 chain_index,
                 pos_in_chain,
             );
-            let other_result = PoseidonTweak44::apply(&parameter, &other_tweak, &[message]);
+            let other_result = PoseidonTweak44::apply(&parameter, &other_tweak, &[message], None);
             prop_assert_ne!(result1, other_result);
         }
 
@@ -1372,6 +1396,7 @@ mod tests {
                     parameter,
                     &TH::tree_tweak(level, (parent_start + i) as u32),
                     pair,
+                    None,
                 )
             })
             .collect()
